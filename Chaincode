@@ -1,0 +1,411 @@
+// Package main: bondcc - tokenised corporate bond chaincode for Drunix (HLF 2.5 compatible).
+//
+// Replaces TokenisedBondPool.sol. Modules (per FastrPay architecture):
+//   AssetToken        MintToken, GetToken
+//   Compliance        SetKYC
+//   CSEVerifier       verifyProof (ed25519, threshold of registered DCE nodes)
+//   Trade / DvP leg   LockAsset, SettleLeg, ReleaseLock
+//   PaymentReservation lives on the wCBDC side; this chaincode only checks the CSE proof
+//   Collateral pool   ListAsset, UpdateRisk, LockCollateral, Borrow, Repay, ReleaseCollateral, Liquidate
+//
+// Determinism rules: NO floats, NO time.Now(). All maths is integer; time comes from the tx timestamp.
+package main
+
+import (
+	"crypto/ed25519"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+
+	"github.com/hyperledger/fabric-contract-api-go/contractapi"
+)
+
+const (
+	maxStaleSecs   = 86400 // risk update validity
+	liqBufferBps   = 500   // liquidate when debt > maxBorrow * 1.05
+	maxLtvBps      = 9000
+	enforceRoles   = false // set true once CA enrols CSE/oracle identities with attribute role=cse|oracle|admin
+	keyThreshold   = "CFG_THRESHOLD"
+	prefixToken    = "TOKEN_"
+	prefixKYC      = "KYC_"
+	prefixNode     = "NODE_"
+	prefixAsset    = "ASSET_"
+	prefixPosition = "POS_"
+)
+
+type BondContract struct{ contractapi.Contract }
+
+type Token struct {
+	ID      string `json:"id"`
+	ISIN    string `json:"isin"`
+	Owner   string `json:"owner"`
+	Units   int64  `json:"units"`
+	Status  string `json:"status"` // FREE | LOCKED | COLLATERAL
+	Batch   string `json:"batch"`
+	Expiry  int64  `json:"expiry"`
+	Settled string `json:"settled"` // last settled batch (idempotency)
+}
+
+type Asset struct {
+	ISIN    string `json:"isin"`
+	LtvBps  int64  `json:"ltvBps"`
+	PriceE6 int64  `json:"priceE6"` // INR per unit * 1e6
+	Updated int64  `json:"updated"`
+}
+
+type Position struct {
+	Debt int64 `json:"debt"`
+}
+
+type Proof struct {
+	Commitment string            `json:"commitment"`
+	Sigs       map[string]string `json:"sigs"` // node name -> hex ed25519 signature over commitment
+}
+
+// ---------- helpers ----------
+
+func now(ctx contractapi.TransactionContextInterface) (int64, error) {
+	ts, err := ctx.GetStub().GetTxTimestamp()
+	if err != nil {
+		return 0, err
+	}
+	return ts.Seconds, nil
+}
+
+func requireRole(ctx contractapi.TransactionContextInterface, role string) error {
+	if !enforceRoles {
+		return nil
+	}
+	return ctx.GetClientIdentity().AssertAttributeValue("role", role)
+}
+
+func put(ctx contractapi.TransactionContextInterface, key string, v interface{}) error {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+	return ctx.GetStub().PutState(key, b)
+}
+
+func get(ctx contractapi.TransactionContextInterface, key string, out interface{}) (bool, error) {
+	b, err := ctx.GetStub().GetState(key)
+	if err != nil {
+		return false, err
+	}
+	if b == nil {
+		return false, nil
+	}
+	return true, json.Unmarshal(b, out)
+}
+
+func (c *BondContract) token(ctx contractapi.TransactionContextInterface, id string) (*Token, error) {
+	var t Token
+	ok, err := get(ctx, prefixToken+id, &t)
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
+		return nil, fmt.Errorf("token %s not found", id)
+	}
+	return &t, nil
+}
+
+// maxBorrow = units * priceE6/1e6 * ltvBps/1e4, all integer, rejects stale risk data.
+func (c *BondContract) maxBorrow(ctx contractapi.TransactionContextInterface, t *Token) (int64, error) {
+	var a Asset
+	ok, err := get(ctx, prefixAsset+t.ISIN, &a)
+	if err != nil || !ok {
+		return 0, fmt.Errorf("asset %s not listed", t.ISIN)
+	}
+	n, err := now(ctx)
+	if err != nil {
+		return 0, err
+	}
+	if a.Updated == 0 || n-a.Updated > maxStaleSecs {
+		return 0, fmt.Errorf("stale or missing price")
+	}
+	return t.Units * a.PriceE6 / 1_000_000 * a.LtvBps / 10_000, nil
+}
+
+// ---------- admin / compliance / registry ----------
+
+func (c *BondContract) RegisterCSENode(ctx contractapi.TransactionContextInterface, name, pubKeyHex string) error {
+	if err := requireRole(ctx, "admin"); err != nil {
+		return err
+	}
+	if b, err := hex.DecodeString(pubKeyHex); err != nil || len(b) != ed25519.PublicKeySize {
+		return fmt.Errorf("bad ed25519 public key")
+	}
+	return ctx.GetStub().PutState(prefixNode+name, []byte(pubKeyHex))
+}
+
+func (c *BondContract) SetThreshold(ctx contractapi.TransactionContextInterface, n int) error {
+	if err := requireRole(ctx, "admin"); err != nil {
+		return err
+	}
+	return put(ctx, keyThreshold, n)
+}
+
+func (c *BondContract) SetKYC(ctx contractapi.TransactionContextInterface, party string, ok bool) error {
+	if err := requireRole(ctx, "admin"); err != nil {
+		return err
+	}
+	return put(ctx, prefixKYC+party, ok)
+}
+
+func (c *BondContract) ListAsset(ctx contractapi.TransactionContextInterface, isin string, ltvBps int64) error {
+	if err := requireRole(ctx, "admin"); err != nil {
+		return err
+	}
+	if ltvBps < 0 || ltvBps > maxLtvBps {
+		return fmt.Errorf("ltv out of range")
+	}
+	return put(ctx, prefixAsset+isin, Asset{ISIN: isin, LtvBps: ltvBps})
+}
+
+// UpdateRisk is called by the pricing oracle (Python Vasicek/ES model) with integer fixed-point values.
+func (c *BondContract) UpdateRisk(ctx contractapi.TransactionContextInterface, isin string, ltvBps, priceE6 int64) error {
+	if err := requireRole(ctx, "oracle"); err != nil {
+		return err
+	}
+	var a Asset
+	ok, err := get(ctx, prefixAsset+isin, &a)
+	if err != nil || !ok || ltvBps < 0 || ltvBps > maxLtvBps || priceE6 <= 0 {
+		return fmt.Errorf("bad risk update")
+	}
+	n, err := now(ctx)
+	if err != nil {
+		return err
+	}
+	a.LtvBps, a.PriceE6, a.Updated = ltvBps, priceE6, n
+	if err := put(ctx, prefixAsset+isin, a); err != nil {
+		return err
+	}
+	return ctx.GetStub().SetEvent("RISK_UPDATED", []byte(fmt.Sprintf(`{"isin":"%s","ltvBps":%d}`, isin, ltvBps)))
+}
+
+// ---------- AssetToken ----------
+
+func (c *BondContract) MintToken(ctx contractapi.TransactionContextInterface, id, isin, owner string, units int64) error {
+	if err := requireRole(ctx, "admin"); err != nil {
+		return err
+	}
+	var t Token
+	if ok, err := get(ctx, prefixToken+id, &t); err != nil || ok {
+		return fmt.Errorf("token exists or read error")
+	}
+	if units <= 0 {
+		return fmt.Errorf("units must be > 0")
+	}
+	return put(ctx, prefixToken+id, Token{ID: id, ISIN: isin, Owner: owner, Units: units, Status: "FREE"})
+}
+
+func (c *BondContract) GetToken(ctx contractapi.TransactionContextInterface, id string) (*Token, error) {
+	return c.token(ctx, id)
+}
+
+// ---------- DvP asset leg (called by the CSE) ----------
+
+func (c *BondContract) LockAsset(ctx contractapi.TransactionContextInterface, batchID, tokenID string, expiry int64) error {
+	if err := requireRole(ctx, "cse"); err != nil {
+		return err
+	}
+	t, err := c.token(ctx, tokenID)
+	if err != nil {
+		return err
+	}
+	n, _ := now(ctx)
+	if t.Status != "FREE" || expiry <= n {
+		return fmt.Errorf("lock failed")
+	}
+	t.Status, t.Batch, t.Expiry = "LOCKED", batchID, expiry
+	if err := put(ctx, prefixToken+tokenID, t); err != nil {
+		return err
+	}
+	return ctx.GetStub().SetEvent("LOCKED", []byte(fmt.Sprintf(`{"batch":"%s","token":"%s"}`, batchID, tokenID)))
+}
+
+// ReleaseLock: CSE may release any time; anyone may release after expiry (liveness guarantee).
+func (c *BondContract) ReleaseLock(ctx contractapi.TransactionContextInterface, batchID, tokenID string) error {
+	t, err := c.token(ctx, tokenID)
+	if err != nil {
+		return err
+	}
+	if t.Status != "LOCKED" || t.Batch != batchID {
+		return nil // idempotent
+	}
+	n, _ := now(ctx)
+	if n < t.Expiry {
+		if err := requireRole(ctx, "cse"); err != nil {
+			return err
+		}
+	}
+	t.Status, t.Batch, t.Expiry = "FREE", "", 0
+	if err := put(ctx, prefixToken+tokenID, t); err != nil {
+		return err
+	}
+	return ctx.GetStub().SetEvent("RELEASED", []byte(fmt.Sprintf(`{"batch":"%s","token":"%s"}`, batchID, tokenID)))
+}
+
+// verifyProof is the CSEVerifier: >= threshold valid ed25519 signatures from registered DCE nodes.
+func (c *BondContract) verifyProof(ctx contractapi.TransactionContextInterface, p *Proof) (bool, error) {
+	var threshold int
+	if ok, err := get(ctx, keyThreshold, &threshold); err != nil || !ok || threshold < 1 {
+		return false, fmt.Errorf("threshold not configured")
+	}
+	good := 0
+	for name, sigHex := range p.Sigs {
+		pk, err := ctx.GetStub().GetState(prefixNode + name)
+		if err != nil || pk == nil {
+			continue
+		}
+		pub, err1 := hex.DecodeString(string(pk))
+		sig, err2 := hex.DecodeString(sigHex)
+		if err1 == nil && err2 == nil && len(pub) == ed25519.PublicKeySize && ed25519.Verify(pub, []byte(p.Commitment), sig) {
+			good++
+		}
+	}
+	return good >= threshold, nil
+}
+
+// SettleLeg transfers ownership iff locked for this batch, not expired, receiver is KYC'd and the proof verifies.
+func (c *BondContract) SettleLeg(ctx contractapi.TransactionContextInterface, batchID, tokenID, newOwner, proofJSON string) error {
+	if err := requireRole(ctx, "cse"); err != nil {
+		return err
+	}
+	t, err := c.token(ctx, tokenID)
+	if err != nil {
+		return err
+	}
+	if t.Settled == batchID {
+		return nil // idempotent retry
+	}
+	if t.Status != "LOCKED" || t.Batch != batchID {
+		return fmt.Errorf("not locked for batch")
+	}
+	n, _ := now(ctx)
+	if n >= t.Expiry {
+		return fmt.Errorf("lock expired")
+	}
+	var kyc bool
+	if ok, err := get(ctx, prefixKYC+newOwner, &kyc); err != nil || !ok || !kyc {
+		return fmt.Errorf("receiver KYC")
+	}
+	var p Proof
+	if err := json.Unmarshal([]byte(proofJSON), &p); err != nil {
+		return fmt.Errorf("bad proof encoding")
+	}
+	if ok, err := c.verifyProof(ctx, &p); err != nil || !ok {
+		return fmt.Errorf("bad proof")
+	}
+	t.Owner, t.Status, t.Batch, t.Expiry, t.Settled = newOwner, "FREE", "", 0, batchID
+	if err := put(ctx, prefixToken+tokenID, t); err != nil {
+		return err
+	}
+	return ctx.GetStub().SetEvent("TRANSFERRED", []byte(fmt.Sprintf(`{"batch":"%s","token":"%s","to":"%s","proof":"%s"}`, batchID, tokenID, newOwner, p.Commitment)))
+}
+
+// ---------- Collateral pool ----------
+
+func (c *BondContract) LockCollateral(ctx contractapi.TransactionContextInterface, tokenID string) error {
+	t, err := c.token(ctx, tokenID)
+	if err != nil {
+		return err
+	}
+	var a Asset
+	if ok, err := get(ctx, prefixAsset+t.ISIN, &a); err != nil || !ok || t.Status != "FREE" {
+		return fmt.Errorf("ineligible")
+	}
+	t.Status = "COLLATERAL"
+	if err := put(ctx, prefixToken+tokenID, t); err != nil {
+		return err
+	}
+	return put(ctx, prefixPosition+tokenID, Position{})
+}
+
+func (c *BondContract) Borrow(ctx contractapi.TransactionContextInterface, tokenID string, amount int64) error {
+	if err := requireRole(ctx, "cse"); err != nil {
+		return err
+	}
+	t, err := c.token(ctx, tokenID)
+	if err != nil {
+		return err
+	}
+	var p Position
+	if ok, err := get(ctx, prefixPosition+tokenID, &p); err != nil || !ok || t.Status != "COLLATERAL" || amount <= 0 {
+		return fmt.Errorf("no collateral")
+	}
+	mb, err := c.maxBorrow(ctx, t)
+	if err != nil {
+		return err
+	}
+	if p.Debt+amount > mb {
+		return fmt.Errorf("LTV exceeded")
+	}
+	p.Debt += amount
+	return put(ctx, prefixPosition+tokenID, p)
+}
+
+func (c *BondContract) Repay(ctx contractapi.TransactionContextInterface, tokenID string, amount int64) error {
+	var p Position
+	if ok, err := get(ctx, prefixPosition+tokenID, &p); err != nil || !ok || amount <= 0 {
+		return fmt.Errorf("no position")
+	}
+	if amount > p.Debt {
+		amount = p.Debt
+	}
+	p.Debt -= amount
+	return put(ctx, prefixPosition+tokenID, p)
+}
+
+func (c *BondContract) ReleaseCollateral(ctx contractapi.TransactionContextInterface, tokenID string) error {
+	t, err := c.token(ctx, tokenID)
+	if err != nil {
+		return err
+	}
+	var p Position
+	if ok, err := get(ctx, prefixPosition+tokenID, &p); err != nil || !ok || t.Status != "COLLATERAL" || p.Debt != 0 {
+		return fmt.Errorf("debt outstanding")
+	}
+	t.Status = "FREE"
+	if err := put(ctx, prefixToken+tokenID, t); err != nil {
+		return err
+	}
+	return ctx.GetStub().DelState(prefixPosition + tokenID)
+}
+
+func (c *BondContract) Liquidate(ctx contractapi.TransactionContextInterface, tokenID string) error {
+	if err := requireRole(ctx, "cse"); err != nil {
+		return err
+	}
+	t, err := c.token(ctx, tokenID)
+	if err != nil {
+		return err
+	}
+	var p Position
+	if ok, err := get(ctx, prefixPosition+tokenID, &p); err != nil || !ok {
+		return fmt.Errorf("no position")
+	}
+	mb, err := c.maxBorrow(ctx, t)
+	if err != nil {
+		return err
+	}
+	if p.Debt*10_000 <= mb*(10_000+liqBufferBps) {
+		return fmt.Errorf("healthy")
+	}
+	t.Owner, t.Status = "LIQUIDATOR", "FREE"
+	p.Debt = 0
+	if err := put(ctx, prefixToken+tokenID, t); err != nil {
+		return err
+	}
+	return put(ctx, prefixPosition+tokenID, p)
+}
+
+func (c *BondContract) GetPosition(ctx contractapi.TransactionContextInterface, tokenID string) (*Position, error) {
+	var p Position
+	ok, err := get(ctx, prefixPosition+tokenID, &p)
+	if err != nil || !ok {
+		return nil, fmt.Errorf("no position")
+	}
+	return &p, nil
+}
