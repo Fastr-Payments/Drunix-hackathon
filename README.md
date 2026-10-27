@@ -14,13 +14,13 @@ FastrPay Team
 
 # FastrPay Coordination State Engine (CSE) – Tokenised Corporate Bonds on Drunix
 
-**NPCI Drunix Hackathon · Problem statement 2:** *Real-asset tokenisation – digital tokens with smart contracts that automatically manage ownership, collateralisation, transfer and release.*
+**NPCI Drunix Hackathon - Fintech Infrastructure Innovation : A verifiable Coordination State Platform & Problem statement 2:** *Real-asset tokenisation – digital tokens with smart contracts that atomically manage ownership, collateralisation, transfer and release.*
 
-## The problem
+## The problem and how Drunix is used for tokenised Bond platform
 A tokenised bond trade spans two independent systems: the bond ledger (**Drunix**) and the cash platform (**wCBDC**). Each finalises its own leg, and nothing makes the two conditional on each other without a custodian or escrow. Whoever moves first is exposed, and a failure on one side leaves a half-done trade.
 
 ## The solution
-**Separate coordination from execution.** The **Coordination State Engine (CSE)**, run as a network of institution-operated **Distributed Coordination Engine (DCE)** nodes, decides when both legs are cleared. It never holds funds or assets. Each system locks or earmarks its own leg in place, the DCE nodes agree the batch by quorum and issue a cryptographic proof, and each system verifies that proof before settling. If anything fails or the timer expires, everything is released. A stochastic pricing engine prices the bond, sets collateral LTV and gates trade prices.
+**Separate coordination from execution.** The **Coordination State Engine (CSE)**, run as a network of institution-operated **Distributed Coordination Engine (DCE)** nodes, decides when both legs are cleared. It never holds funds or assets. Each system locks or earmarks its own leg in place, the DCE nodes agree the batch by quorum and issue a cryptographic proof, and each system verifies that proof before settling. If anything fails or the timer expires, everything is released. A stochastic pricing engine prices the bond, sets collateral LTV and gates trade prices. The CSE is comprised of governed/permissioned Distributed Coordination nodes for resilience, censorship and no concentration of authority. This Architecture can easily be extended to other forms of DLT, Oracles and protocols when required. 
 
 ```mermaid
 flowchart LR
