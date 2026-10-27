@@ -21,7 +21,9 @@ A tokenised bond trade spans distinct independent and regulatory systems. For th
 During the workflow processing, a number of constraints, checks, and rules are to be enforced. That requires coordination. And imagine these requirements are fragmented and sometimes, can include cross border authentication or authorisation. This compounds the need of Coordination than just Execution. Execution commoditizes but Coordination, doesnot. 
 
 ## The solution
-**Separate coordination from execution.** The **Coordination State Engine (CSE)**, run as a network of institution-operated **Distributed Coordination Engine (DCE)** nodes, decides when both legs are cleared. It never holds funds or assets. Each system locks or earmarks its own leg in place, the DCE nodes agree the batch by quorum and issue a cryptographic proof, and each system verifies that proof before settling. If anything fails or the timer expires, everything is released. A stochastic pricing engine prices the bond, sets collateral LTV and gates trade prices. The CSE is comprised of governed/permissioned Distributed Coordination nodes for resilience, censorship and no concentration of authority. This Architecture can easily be extended to other forms of DLT, Oracles and protocols when required. 
+**Separate coordination from execution.** The **Coordination State Engine (CSE)**, run as a network of institution-operated **Distributed Coordination Engine (DCE)** nodes, decides when both legs are cleared. It never holds funds or assets. Each system locks or earmarks its own leg in place, the DCE nodes agree the batch by quorum and issue a cryptographic proof, and each system verifies that proof before settling. If anything fails or the timer expires, everything is released. 
+
+Bit of programmability - A stochastic pricing engine prices the bond, sets collateral LTV and gates trade prices. The CSE is comprised of governed/permissioned Distributed Coordination nodes for resilience, censorship and no concentration of authority. This Architecture can easily be extended to other forms of DLT, Oracles and protocols when required. 
 
 ```mermaid
 flowchart LR
